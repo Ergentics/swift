@@ -1,0 +1,109 @@
+name: Build toolchain
+
+# Manually triggered build of this fork, for testing compiler patches.
+#
+# "compiler" builds the compiler and standard library only. It is sized for a
+# standard GitHub-hosted runner (4 cores, 16 GB, 6 hour job limit).
+#
+# "toolchain" builds the full Linux toolchain with the buildbot_linux,no_test
+# preset. It does not finish within 6 hours on a standard runner, so pass the
+# label of a larger GitHub-hosted runner or a self-hosted runner as "runner".
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: What to build
+        type: choice
+        options:
+          - compiler
+          - toolchain
+        default: compiler
+      runner:
+        description: Runner label (the full toolchain needs a larger or self-hosted runner)
+        type: string
+        default: ubuntu-24.04
+      scheme:
+        description: update-checkout scheme for the other repositories
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  BUILD: ${{ inputs.build || 'compiler' }}
+  SCHEME: ${{ inputs.scheme || 'main' }}
+  # Official Swift 6.2.4 image, the host toolchain swift-ci uses on Ubuntu 24.04.
+  SWIFT_IMAGE: swift:6.2.4-noble@sha256:eccc7a97f9b9881d9659e2e788081fd7675f86d39793b51200bfb178398b3784
+
+jobs:
+  build:
+    name: Build ${{ inputs.build || 'compiler' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 4320
+    steps:
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost
+          docker image prune --all --force
+          df -h / /mnt
+
+      - name: Choose build directory
+        run: |
+          # GitHub-hosted runners have a larger scratch disk at /mnt and a
+          # 6 hour job limit; stop the build 30 minutes early to save the cache.
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            minutes=330
+            root=/mnt/swift-build
+            sudo mkdir -p "$root"
+            sudo chown "$(id -u):$(id -g)" "$root"
+          else
+            minutes=4200
+            root="$RUNNER_TEMP/swift-build"
+            mkdir -p "$root"
+          fi
+          mkdir -p "$root/sccache"
+          echo "BUILD_ROOT=$root" >> "$GITHUB_ENV"
+          echo "MINUTES=$minutes" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: swift
+          persist-credentials: false
+
+      - name: Restore sccache cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BUILD_ROOT }}/sccache
+          key: sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$BUILD_ROOT:/build" \
+            -e SWIFT_SOURCE_ROOT=/src \
+            -e SWIFT_BUILD_ROOT=/build \
+            -e SCCACHE_DIR=/build/sccache \
+            -e SCCACHE_CACHE_SIZE=6G \
+            "$SWIFT_IMAGE" \
+            /src/swift/.github/scripts/build-toolchain.sh "$BUILD" "$SCHEME" "$MINUTES"
+
+      - name: Save sccache cache
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BUILD_ROOT }}/sccache
+          key: sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload package
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swift-${{ env.BUILD }}-linux-${{ runner.arch }}
+          path: ${{ env.BUILD_ROOT }}/swift-*-linux.tar.gz
+          if-no-files-found: error
