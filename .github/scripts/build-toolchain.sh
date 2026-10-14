@@ -19,13 +19,15 @@ step() {
   echo "== $(date -u +%H:%M:%S) $*"
 }
 
-# Everything here runs as root. Hand the sources, the build and the cache back
-# to the runner user so later steps and jobs can read and delete them.
+# Everything here runs as root. Give the sources, the build and the cache back
+# to whoever owns the mounted workspace (the runner user, or root under
+# rootless Docker) so later steps and jobs can read and delete them.
 finish() {
   if command -v sccache >/dev/null; then
     sccache --stop-server || true
   fi
-  chown -R "$HOST_UID:$HOST_GID" "$SWIFT_SOURCE_ROOT" "$SWIFT_BUILD_ROOT" || true
+  chown -R "$(stat -c %u:%g "$SWIFT_SOURCE_ROOT")" \
+    "$SWIFT_SOURCE_ROOT" "$SWIFT_BUILD_ROOT" || true
   df -h "$SWIFT_SOURCE_ROOT" "$SWIFT_BUILD_ROOT" || true
 }
 trap finish EXIT
@@ -72,8 +74,27 @@ git config --global --add safe.directory '*'
 
 cd "$SWIFT_SOURCE_ROOT/swift"
 step "Cloning the other repositories"
-utils/update-checkout --clone --skip-history --skip-tags \
-  --scheme "$scheme" --skip-repository swift
+# A re-run of a workflow run clones the same revisions as its first attempt, so
+# the C and C++ objects in the sccache cache still match. The pinned revisions
+# are saved with the cache.
+pin=$SWIFT_BUILD_ROOT/checkout/$GITHUB_RUN_ID.json
+if [[ -f $pin ]]; then
+  utils/update-checkout --clone --skip-history --skip-tags \
+    --config "$pin" --scheme pinned --skip-repository swift
+else
+  utils/update-checkout --clone --skip-history --skip-tags \
+    --scheme "$scheme" --skip-repository swift
+  mkdir -p "${pin%/*}"
+  # Repositories that were not cloned are listed as "skip"; leave them out.
+  utils/update-checkout --dump-hashes-config pinned | python3 -c '
+import json, sys
+config = json.load(sys.stdin)
+repos = config["branch-schemes"]["pinned"]["repos"]
+config["branch-schemes"]["pinned"]["repos"] = {
+    name: rev for name, rev in repos.items() if rev != "skip"}
+json.dump(config, sys.stdout, indent=1)' > "$pin.tmp"
+  mv "$pin.tmp" "$pin"
+fi
 
 case $mode in
   compiler)

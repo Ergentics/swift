@@ -91,7 +91,7 @@ jobs:
             root="$RUNNER_TEMP/swift-build"
             mkdir -p "$root"
           fi
-          mkdir -p "$root/sccache"
+          mkdir -p "$root/sccache" "$root/checkout"
           echo "BUILD_ROOT=$root" >> "$GITHUB_ENV"
           df -h / "$root"
 
@@ -101,9 +101,12 @@ jobs:
           persist-credentials: false
 
       - name: Restore sccache cache
+        id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.BUILD_ROOT }}/sccache
+          path: |
+            ${{ env.BUILD_ROOT }}/sccache
+            ${{ env.BUILD_ROOT }}/checkout
           key: sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-
@@ -119,20 +122,21 @@ jobs:
             -e SCCACHE_DIR=/build/sccache \
             -e SCCACHE_CACHE_SIZE=$size \
             -e PYTHONDONTWRITEBYTECODE=1 \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
+            -e GITHUB_RUN_ID \
             "$SWIFT_IMAGE" \
             /src/swift/.github/scripts/build-toolchain.sh "$BUILD" "$SCHEME" "$DEADLINE"
 
       - name: Stop the build container
+        id: stop
         if: always()
         run: |
           # Cancelling the job stops "docker run" but not the container. Stop it
-          # before saving the cache, and give its files to the runner user.
+          # and give the cache to the runner user before saving it.
           if [ -n "$(docker ps -q --filter "name=^${CONTAINER}$")" ]; then
             docker rm -f "$CONTAINER"
-            docker run --rm -v "$GITHUB_WORKSPACE:/src" -v "$BUILD_ROOT:/build" \
-              "$SWIFT_IMAGE" chown -R "$(id -u):$(id -g)" /src /build
+            docker run --rm -v "$BUILD_ROOT:/build" "$SWIFT_IMAGE" \
+              sh -c 'chown -R "$(stat -c %u:%g /build)" /build/sccache /build/checkout'
+            echo "stopped=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload package
@@ -146,8 +150,18 @@ jobs:
           compression-level: 0
 
       - name: Save sccache cache
-        if: always()
+        # Skip it if the job was cancelled before the cache was restored.
+        if: always() && steps.restore.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.BUILD_ROOT }}/sccache
+          path: |
+            ${{ env.BUILD_ROOT }}/sccache
+            ${{ env.BUILD_ROOT }}/checkout
           key: sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Clean up after the container
+        if: always() && steps.stop.outputs.stopped == 'true'
+        run: |
+          # The stopped container could not hand its files back itself.
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -v "$BUILD_ROOT:/build" \
+            "$SWIFT_IMAGE" sh -c 'chown -R "$(stat -c %u:%g /src)" /src /build'
