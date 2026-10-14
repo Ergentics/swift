@@ -8,7 +8,8 @@ name: Build toolchain
 # preset. It does not fit a standard GitHub-hosted runner (4 cores, 6 hour job
 # limit), so pass the label of a larger or self-hosted runner as "runner".
 #
-# The job stops at "minutes" (30 by default). The build is stopped a few
+# The job stops at "minutes" (30 by default; a compiler build needs about 360
+# on a standard runner, and may need one re-run). The build is stopped a few
 # minutes before that so the sccache cache can still be saved, and a re-run
 # then reuses the C and C++ objects compiled so far.
 on:
@@ -50,6 +51,7 @@ env:
   BUILD: ${{ inputs.build || 'compiler' }}
   SCHEME: ${{ inputs.scheme || 'main' }}
   MINUTES: ${{ inputs.minutes || 30 }}
+  CONTAINER: swift-build-${{ github.run_id }}-${{ github.run_attempt }}
   # Official Swift 6.2.4 image, the host toolchain swift-ci uses on Ubuntu 24.04.
   SWIFT_IMAGE: swift:6.2.4-noble@sha256:eccc7a97f9b9881d9659e2e788081fd7675f86d39793b51200bfb178398b3784
 
@@ -61,8 +63,14 @@ jobs:
     steps:
       - name: Set build deadline
         run: |
-          # Leave 5 minutes after the build to save the cache and the package.
-          echo "DEADLINE=$(( $(date +%s) + (MINUTES - 5) * 60 ))" >> "$GITHUB_ENV"
+          minutes=$MINUTES
+          # GitHub-hosted runners stop every job at 6 hours.
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ] && [ "$minutes" -gt 360 ]; then
+            minutes=360
+          fi
+          # Leave time after the build to save the cache and the package.
+          if [ "$minutes" -gt 60 ]; then reserve=15; else reserve=5; fi
+          echo "DEADLINE=$(( $(date +%s) + (minutes - reserve) * 60 ))" >> "$GITHUB_ENV"
 
       - name: Free disk space
         if: runner.environment == 'github-hosted' && env.BUILD == 'toolchain'
@@ -102,15 +110,40 @@ jobs:
 
       - name: Build
         run: |
-          docker run --rm \
+          if [ "$BUILD" = compiler ]; then size=4G; else size=6G; fi
+          docker run --rm --name "$CONTAINER" \
             -v "$GITHUB_WORKSPACE:/src" \
             -v "$BUILD_ROOT:/build" \
             -e SWIFT_SOURCE_ROOT=/src \
             -e SWIFT_BUILD_ROOT=/build \
             -e SCCACHE_DIR=/build/sccache \
-            -e SCCACHE_CACHE_SIZE=6G \
+            -e SCCACHE_CACHE_SIZE=$size \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             "$SWIFT_IMAGE" \
             /src/swift/.github/scripts/build-toolchain.sh "$BUILD" "$SCHEME" "$DEADLINE"
+
+      - name: Stop the build container
+        if: always()
+        run: |
+          # Cancelling the job stops "docker run" but not the container. Stop it
+          # before saving the cache, and give its files to the runner user.
+          if [ -n "$(docker ps -q --filter "name=^${CONTAINER}$")" ]; then
+            docker rm -f "$CONTAINER"
+            docker run --rm -v "$GITHUB_WORKSPACE:/src" -v "$BUILD_ROOT:/build" \
+              "$SWIFT_IMAGE" chown -R "$(id -u):$(id -g)" /src /build
+          fi
+
+      - name: Upload package
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swift-${{ env.BUILD }}-linux-${{ runner.arch }}
+          path: ${{ env.BUILD_ROOT }}/swift-*-linux.tar.gz
+          if-no-files-found: warn
+          # Already compressed.
+          compression-level: 0
 
       - name: Save sccache cache
         if: always()
@@ -118,11 +151,3 @@ jobs:
         with:
           path: ${{ env.BUILD_ROOT }}/sccache
           key: sccache-${{ env.BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Upload package
-        if: success()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: swift-${{ env.BUILD }}-linux-${{ runner.arch }}
-          path: ${{ env.BUILD_ROOT }}/swift-*-linux.tar.gz
-          if-no-files-found: error
