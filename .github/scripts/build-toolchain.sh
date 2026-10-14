@@ -2,17 +2,24 @@
 # Builds Swift inside the official swift container image, for the
 # "Build toolchain" workflow.
 #
-# Usage: build-toolchain.sh <compiler|toolchain> <update-checkout scheme> <minutes>
+# Usage: build-toolchain.sh <compiler|toolchain> <update-checkout scheme> <deadline>
 #
 # Expects the source root (this repository checked out as swift/) at
 # SWIFT_SOURCE_ROOT and an empty build root at SWIFT_BUILD_ROOT. The build is
-# stopped after <minutes> so the workflow still has time to save its sccache
-# cache; re-running the workflow then reuses the cached C and C++ objects.
+# stopped at <deadline> (seconds since the epoch) so the workflow still has
+# time to save its sccache cache; re-running the workflow then reuses the
+# cached C and C++ objects.
 set -euo pipefail
 
 mode=$1
 scheme=$2
-minutes=$3
+deadline=$3
+
+step() {
+  echo "== $(date -u +%H:%M:%S) $*"
+}
+
+step "Installing build dependencies"
 
 # Build dependencies, from swiftlang/swift-docker swift-ci/main/ubuntu/24.04.
 export DEBIAN_FRONTEND=noninteractive
@@ -25,6 +32,7 @@ apt-get -q install -y \
   swig systemtap-sdt-dev tzdata uuid-dev zip
 
 sccache=()
+step "Installing sccache"
 if [[ $(uname -m) == x86_64 ]]; then
   version=v0.17.0
   name=sccache-$version-x86_64-unknown-linux-musl
@@ -42,6 +50,7 @@ fi
 git config --global --add safe.directory '*'
 
 cd "$SWIFT_SOURCE_ROOT/swift"
+step "Cloning the other repositories"
 utils/update-checkout --clone --skip-history --skip-tags \
   --scheme "$scheme" --skip-repository swift
 
@@ -70,12 +79,20 @@ case $mode in
     ;;
 esac
 
+seconds=$(( deadline - $(date +%s) ))
+if (( seconds <= 0 )); then
+  echo "::error::No time left to build. Raise the minutes input."
+  exit 1
+fi
+step "Building for up to $(( seconds / 60 )) minutes"
 status=0
-timeout --signal=INT --kill-after=5m "${minutes}m" utils/build-script "${sccache[@]}" "${args[@]}" || status=$?
+timeout --signal=INT --kill-after=2m "$seconds" \
+  utils/build-script "${sccache[@]}" "${args[@]}" || status=$?
+step "Build finished with status $status"
 if [[ ${#sccache[@]} -gt 0 ]]; then
   sccache --show-stats
 fi
 if [[ $status -eq 124 ]]; then
-  echo "::error::Build stopped after $minutes minutes. Re-run to continue from the sccache cache, or use a larger runner."
+  echo "::error::Build ran out of time. Re-run to continue from the sccache cache, raise the minutes input, or use a larger runner."
 fi
 exit "$status"
