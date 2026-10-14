@@ -26,6 +26,11 @@ on:
         description: update-checkout scheme for the other repositories
         type: string
         default: main
+  # TEMPORARY: validates the workflow on its pull request; removed before merge.
+  pull_request:
+    paths:
+      - .github/workflows/build-toolchain.yml
+      - .github/scripts/build-toolchain.sh
 
 permissions:
   contents: read
